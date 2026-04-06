@@ -397,10 +397,13 @@ body::before {
 
 /* ── PLAYER ──────────────────────────────────────────────────── */
 .player {
-  position: fixed; bottom: 0; left: 0; right: 0; height: var(--ph);
+  position: fixed; bottom: 0; left: 0; right: 0;
+  height: calc(var(--ph) + env(safe-area-inset-bottom, 0px));
   background: var(--bg2);
   border-top: 1px solid var(--border);
-  display: flex; align-items: center; padding: 0 16px; gap: 12px; z-index: 100;
+  display: flex; align-items: center;
+  padding: 0 16px env(safe-area-inset-bottom, 0px);
+  gap: 12px; z-index: 100;
 }
 
 /* Warm groove line at top of player */
@@ -757,7 +760,7 @@ body::before {
 
 <script>
 // ── STATE ─────────────────────────────────────────────────────────
-const SK='phonoteka_v3', AP='ph3_au_';
+const SK='phonoteka_v3';
 let S={pls:[],curPl:null,curTr:null,tab:'s',editPlId:null,editTrIdx:null};
 
 function save(){
@@ -770,6 +773,50 @@ function save(){
 function load(){
   try{ const r=localStorage.getItem(SK); if(r) Object.assign(S,JSON.parse(r)); }catch(e){}
 }
+
+// ── INDEXEDDB (аудиофайлы) ─────────────────────────────────────────
+const IDB_NAME='phonoteka_audio', IDB_STORE='files';
+let _db=null;
+
+function idbOpen(){
+  return new Promise((res,rej)=>{
+    if(_db){res(_db);return;}
+    const req=indexedDB.open(IDB_NAME,1);
+    req.onupgradeneeded=e=>e.target.result.createObjectStore(IDB_STORE);
+    req.onsuccess=e=>{_db=e.target.result;res(_db);};
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbSet(key,blob){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).put(blob,key);
+    tx.oncomplete=()=>res();
+    tx.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbGet(key){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const req=db.transaction(IDB_STORE,'readonly').objectStore(IDB_STORE).get(key);
+    req.onsuccess=e=>res(e.target.result);
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbDel(key){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete=()=>res();
+    tx.onerror=e=>rej(e.target.error);
+  });
+}
+
+// blob URL текущего трека — освобождаем при смене
+let _curBlobUrl=null;
+function _revokeCurrent(){if(_curBlobUrl){URL.revokeObjectURL(_curBlobUrl);_curBlobUrl=null;}}
 
 // ── AUDIO ─────────────────────────────────────────────────────────
 const aud=document.getElementById('aud');
@@ -795,12 +842,20 @@ function seekTo(v){if(aud.duration)aud.currentTime=(v/100)*aud.duration;}
 function setVol(v){aud.volume=v;}
 function togglePlay(){if(aud.src){aud.paused?aud.play():aud.pause();}}
 
-function playTr(plId,idx){
+async function playTr(plId,idx){
   const pl=S.pls.find(p=>p.id===plId); if(!pl) return;
   const t=pl.tracks[idx]; if(!t) return;
   S.curPl=plId; S.curTr=idx;
-  if(t.ak){const d=localStorage.getItem(t.ak); if(d){aud.src=d;aud.play();}}
-  else{aud.src='';aud.pause();}
+  _revokeCurrent();
+  if(t.ak){
+    try{
+      const blob=await idbGet(t.ak);
+      if(blob){
+        _curBlobUrl=URL.createObjectURL(blob);
+        aud.src=_curBlobUrl; aud.play();
+      }
+    }catch(e){console.error('idbGet error',e);}
+  } else {aud.src='';aud.pause();}
   document.getElementById('pIdle').style.display='none';
   document.getElementById('pNow').style.display='block';
   document.getElementById('pName').textContent=t.name;
@@ -936,10 +991,10 @@ function delTr(e,plId,idx){
   e.stopPropagation();
   const pl=S.pls.find(p=>p.id===plId);if(!pl)return;
   const t=pl.tracks[idx];
-  if(t.ak){try{localStorage.removeItem(t.ak);}catch(_){}}
+  if(t.ak) idbDel(t.ak).catch(()=>{});
   pl.tracks.splice(idx,1);
   if(S.curPl===plId&&S.curTr===idx){
-    S.curTr=null;aud.pause();aud.src='';
+    S.curTr=null;aud.pause();aud.src='';_revokeCurrent();
     document.getElementById('pIdle').style.display='block';
     document.getElementById('pNow').style.display='none';
     document.getElementById('pVinyl').classList.remove('playing');
@@ -966,9 +1021,9 @@ function editTr(e,plId,idx){
 function deletePl(){
   const pl=S.pls.find(p=>p.id===S.curPl);
   if(!pl||!confirm(`Удалить «${pl.name}»?`))return;
-  pl.tracks.forEach(t=>{if(t.ak)try{localStorage.removeItem(t.ak);}catch(_){}});
+  pl.tracks.forEach(t=>{if(t.ak)idbDel(t.ak).catch(()=>{});});
   S.pls=S.pls.filter(p=>p.id!==S.curPl);S.curPl=null;
-  aud.pause();aud.src='';
+  aud.pause();aud.src='';_revokeCurrent();
   document.getElementById('pIdle').style.display='block';
   document.getElementById('pNow').style.display='none';
   document.getElementById('pVinyl').classList.remove('playing');
@@ -1070,17 +1125,13 @@ function closeTrModal(){document.getElementById('trModal').classList.add('h');pe
 
 function onFile(inp){
   const f=inp.files[0];if(!f)return;
-  const r=new FileReader();
-  r.onload=e=>{
-    pendAu=e.target.result;
-    document.getElementById('upCh').textContent=f.name;
-    if(!document.getElementById('tName').value)
-      document.getElementById('tName').value=f.name.replace(/\.[^.]+$/,'');
-  };
-  r.readAsDataURL(f);
+  pendAu=f; // храним Blob напрямую, без base64
+  document.getElementById('upCh').textContent=f.name;
+  if(!document.getElementById('tName').value)
+    document.getElementById('tName').value=f.name.replace(/\.[^.]+$/,'');
 }
 
-function saveTr(){
+async function saveTr(){
   const name=document.getElementById('tName').value.trim();if(!name){document.getElementById('tName').focus();return;}
   const artist=document.getElementById('tArtist').value.trim();
   const mood=document.getElementById('tMood').value.trim();
@@ -1090,15 +1141,15 @@ function saveTr(){
   if(S.editTrIdx!==null){
     const t=pl.tracks[S.editTrIdx];Object.assign(t,{name,artist,mood,urls});
     if(pendAu){
-      if(t.ak)try{localStorage.removeItem(t.ak);}catch(_){}
-      t.ak=AP+Date.now();
-      try{localStorage.setItem(t.ak,pendAu);}catch(e){alert('Файл слишком большой.');}
+      if(t.ak) await idbDel(t.ak).catch(()=>{});
+      t.ak='au_'+Date.now();
+      try{await idbSet(t.ak,pendAu);}catch(e){alert('Не удалось сохранить файл.');delete t.ak;}
     }
   } else {
     const t={name,artist,mood,urls};
     if(pendAu){
-      t.ak=AP+Date.now();
-      try{localStorage.setItem(t.ak,pendAu);}catch(e){alert('Файл слишком большой.');delete t.ak;}
+      t.ak='au_'+Date.now();
+      try{await idbSet(t.ak,pendAu);}catch(e){alert('Не удалось сохранить файл.');delete t.ak;}
     }
     pl.tracks.push(t);
   }
